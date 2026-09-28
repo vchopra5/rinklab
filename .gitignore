@@ -1,0 +1,30 @@
+# Downloaded season data, raw API caches, and coverage reports
+data/
+*.csv
+*.tsv
+*.json.gz
+*.parquet
+
+# Generated arrays and model weights
+*.npy
+*.npz
+*.pt
+*.pth
+*.pkl
+*.joblib
+*.h5
+*.hdf5
+
+# Generated analysis outputs (keep analysis Python scripts)
+**/analysis/**/*.png
+**/analysis/**/*.pdf
+**/analysis/**/*.json
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
