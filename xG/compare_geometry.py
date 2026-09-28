@@ -4,6 +4,7 @@ Run: python compare_geometry.py
 Uses seasons through 2023–24; final test seasons are not evaluated.
 """
 import argparse
+from copy import deepcopy
 import json
 from itertools import combinations
 from pathlib import Path
@@ -24,6 +25,29 @@ from mlp import MLP2D
 from siren import SIREN2D
 
 
+def gradient_check(model):
+    """Use double precision and a fine step to resolve rapid sine oscillations."""
+    q = np.array([71.3, 7.2])
+    eps = 1e-7 if isinstance(model, torch.nn.Module) else .001
+    if isinstance(model, torch.nn.Module):
+        checked = deepcopy(model).double().eval()
+        point = torch.tensor(q, dtype=torch.float64, requires_grad=True)
+        derivative, = torch.autograd.grad(torch.sigmoid(checked(point)), point)
+        analytic = derivative.detach().numpy()
+        def predict(coords):
+            with torch.no_grad():
+                return torch.sigmoid(checked(torch.tensor(coords, dtype=torch.float64))).numpy()
+    else:
+        analytic = model.gradient(q)
+        predict = model.predict_proba
+    numeric = np.array([(predict(np.array([q + eps*a]))[0]
+                         - predict(np.array([q - eps*a]))[0]) / (2*eps)
+                        for a in np.eye(2)])
+    return {"point": q.tolist(), "step_ft": eps,
+            "analytic": analytic.tolist(), "numeric": numeric.tolist(),
+            "max_absolute_error": float(np.abs(analytic - numeric).max())}
+
+
 def rink(ax):
     ax.add_patch(FancyBboxPatch(
         (-100, -42.5), 200, 85, boxstyle="round,pad=0,rounding_size=28",
@@ -39,12 +63,73 @@ def rink(ax):
     ax.set_facecolor("#ededed")
 
 
+def render(folder, destination=None):
+    folder = Path(folder)
+    destination = Path(destination) if destination else folder
+    destination.mkdir(parents=True, exist_ok=True)
+    report = json.loads((folder / 'comparison.json').read_text())
+    settings = report['settings']
+    names = ['Kernel','Logistic','MLP','SIREN']
+    with np.load(folder / 'surfaces.npz') as saved:
+        points = saved['locations'].copy()
+        probabilities = {n:saved[f'{n}_probability'].copy()*100 for n in names}
+        gradients = {n:saved[f'{n}_gradient'].copy()*100 for n in names}
+    pmax = max(p.max() for p in probabilities.values())
+    gmax = max(np.linalg.norm(g,axis=1).max() for g in gradients.values())
+    widths = settings.get('siren_hidden_sizes',[32,32,32])
+    subtitles = [f"radius {settings['radius']:g} ft · bandwidth {settings['bandwidth']:g} ft",
+                 'features: x and y²', '128 → 128 · tanh',
+                 ' → '.join(map(str,widths)) + f" · lr {settings.get('siren_lr',1e-4):g}"]
+    fig, axes = plt.subplots(2,4,figsize=(14,9))
+    fig.subplots_adjust(left=.055,right=.875,top=.79,bottom=.18,wspace=.13,hspace=.22)
+    for col,name in enumerate(names):
+        g = gradients[name]
+        magnitude = np.linalg.norm(g,axis=1)
+        for row,values in enumerate((probabilities[name],magnitude)):
+            raster=np.full((33,31),np.nan)
+            ix=np.rint((points[:,0]-25)/2.5).astype(int)
+            iy=np.rint((points[:,1]+40)/2.5).astype(int)
+            raster[iy,ix]=values
+            im=axes[row,col].imshow(raster,origin='lower',extent=(23.75,101.25,-41.25,41.25),
+                interpolation='nearest',cmap='Blues' if row==0 else 'Purples',
+                norm=plt.Normalize(0,pmax) if row==0 else PowerNorm(.5,vmin=0,vmax=gmax))
+            rink(axes[row,col])
+            if col==0:
+                axes[row,col].set_ylabel('Across the rink (ft)',fontsize=9)
+            if row==0:
+                axes[row,col].set_title(f'{name}\n{subtitles[col]}',fontsize=11,pad=12)
+                probability_image=im
+            else:
+                gradient_image=im
+                axes[row,col].set_xlabel('x (ft; goal line at 89)',fontsize=9)
+        # One physical threshold across all models; do not amplify almost-flat regions.
+        arrow=(np.isclose(points[:,0]%10,0)&np.isclose(points[:,1]%10,0)&(magnitude>=.1))
+        axes[0,col].quiver(points[arrow,0],points[arrow,1],g[arrow,0]/magnitude[arrow],g[arrow,1]/magnitude[arrow],
+            angles='xy',scale_units='xy',scale=.22,width=.006,color='#38434a',alpha=.85)
+    fig.colorbar(probability_image,cax=fig.add_axes([.90,.52,.012,.25]),label='Scoring probability (%)')
+    fig.colorbar(gradient_image,cax=fig.add_axes([.90,.19,.012,.25]),label='Gradient magnitude (percentage points / ft)')
+    fig.text(.055,.96,'How scoring probability changes across the rink',fontsize=20,weight='bold')
+    fig.text(.055,.915,f"{report['n_train']:,} attempts · NHL 5-on-5 regulation · 2009–10 through 2023–24",fontsize=11)
+    fig.text(.055,.875,'Top: predicted scoring probability and direction of increase. Bottom: local gradient magnitude.',fontsize=10)
+    fig.text(.055,.125,'Shared scales within each row; gradient colors use a square-root scale. Gray = outside rink or insufficient data.',fontsize=9)
+    fig.text(.055,.096,'Arrows show direction only and appear at magnitudes ≥ 0.1 percentage points/ft. All teams shoot right.',fontsize=9)
+    fig.text(.055,.067,f"Neural models: {settings['epochs']} epochs, seed {settings['seed']}. SIREN: raw x, y, omega {settings['omega']:g}. Held-out seasons not evaluated.",fontsize=9)
+    fig.text(.055,.038,'Kernel gradients hold neighbors fixed; radius boundaries can jump. These are associations among recorded attempts.',fontsize=9)
+    fig.savefig(destination/'scoring_geometry.png',dpi=180,facecolor='white')
+    fig.savefig(destination/'scoring_geometry.pdf',facecolor='white')
+    plt.close(fig)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=.001)
+    parser.add_argument("--lr", type=float, default=.001, help="MLP learning rate")
+    parser.add_argument("--siren-lr", type=float, default=.0001)
+    parser.add_argument("--siren-hidden-sizes", type=int, nargs="+", default=[32, 32, 32])
     parser.add_argument("--bandwidth", type=float, default=2)
-    parser.add_argument("--radius", type=float, default=1.0)
+    parser.add_argument("--radius", type=float, default=3.0)
+    parser.add_argument("--support-radius", type=float, default=1.0,
+                        help="Fixed data-support radius for comparable plotted locations")
     parser.add_argument("--omega", type=float, default=30)
     parser.add_argument("--seed", type=int, default=42)
     selection = parser.add_mutually_exclusive_group()
@@ -52,12 +137,16 @@ def main():
                         help="Retrain SIREN and reuse the other saved model surfaces.")
     selection.add_argument("--mlp-only", action="store_true",
                            help="Retrain MLP and reuse the other saved model surfaces.")
+    parser.add_argument("--plot-only", action="store_true", help="Redraw saved results without fitting")
     args = parser.parse_args()
     only = "SIREN" if args.siren_only else "MLP" if args.mlp_only else None
     torch.set_num_threads(2)
     root = Path(__file__).resolve().parent
     output = root / "analysis" / "geometry"
     output.mkdir(parents=True, exist_ok=True)
+    if args.plot_only:
+        render(output)
+        return
 
     data = LoadHockeyShots().load_data()
     data = data.loc[data.game_id.astype("int64") // 1_000_000 <= 2023]
@@ -69,13 +158,13 @@ def main():
         "Logistic": LogisticRegression2D,
         "Kernel": lambda: KernelRegression2D(bandwidth=args.bandwidth, radius=args.radius),
         "MLP": MLP2D,
-        "SIREN": lambda: SIREN2D(omega=args.omega),
+        "SIREN": lambda: SIREN2D(omega=args.omega, hidden_sizes=args.siren_hidden_sizes),
     }
     xx, yy = np.meshgrid(np.arange(25, 100.1, 2.5), np.arange(-40, 40.1, 2.5))
     grid = np.column_stack([xx.ravel(), yy.ravel()])
     tree = cKDTree(X)
     support = tree.query_ball_point(grid, r=5, return_length=True)
-    local_support = tree.query_ball_point(grid, r=args.radius, return_length=True)
+    local_support = tree.query_ball_point(grid, r=args.support_radius, return_length=True)
     in_rink = ((grid[:, 0] <= 72) | (np.abs(grid[:, 1]) <= 14.5)
                | ((grid[:, 0] - 72)**2 + (np.abs(grid[:, 1]) - 14.5)**2 <= 28**2))
     keep = (support >= 100) & (local_support >= 20) & in_rink
@@ -83,8 +172,9 @@ def main():
     probabilities, gradients = {}, {}
     report = {"training_end_season": "2023–24", "n_train": len(X),
               "n_games": int(data.game_id.nunique()), "settings": vars(args),
-              "grid_step_ft": 2.5, "support": "At least 100 attempts within 5 ft and 20 within the kernel radius; inside rink",
-              "neural_hidden_layers": 2, "neural_width": {"MLP": 128, "SIREN": 128},
+              "grid_step_ft": 2.5, "support": f"At least 100 attempts within 5 ft and 20 within {args.support_radius:g} ft; inside rink",
+              "neural_hidden_layers": {"MLP": 2, "SIREN": len(args.siren_hidden_sizes)},
+              "neural_width": {"MLP": 128, "SIREN": args.siren_hidden_sizes},
               "supported_grid_points": len(points), "gradient_units": "probability per foot",
               "caveats": ["Single seed, fixed training schedule; no claim of tuned predictive superiority.",
                           "Kernel gradient holds its radius-based neighbor set fixed; cutoff boundaries can jump.",
@@ -92,7 +182,15 @@ def main():
               "models": {}, "pairwise": []}
     if only:
         previous = json.loads((output / "comparison.json").read_text())
+        for setting in ("radius", "bandwidth", "epochs", "lr", "seed", "omega"):
+            if previous["settings"][setting] != getattr(args, setting):
+                raise ValueError(f"Saved {setting} differs; rerun all models to keep the comparison consistent.")
+        if only == "MLP" and (previous["settings"].get("siren_hidden_sizes") != args.siren_hidden_sizes
+                               or previous["settings"].get("siren_lr") != args.siren_lr):
+            raise ValueError("Saved SIREN settings differ; rerun all models.")
         with np.load(output / "surfaces.npz") as saved:
+            if not np.array_equal(saved["locations"], points):
+                raise ValueError("Saved surfaces use a different grid; rerun all models.")
             for name in factories:
                 if name != only:
                     probabilities[name] = saved[f"{name}_probability"]
@@ -105,28 +203,20 @@ def main():
         torch.manual_seed(args.seed)
         model = factory()
         if isinstance(model, torch.nn.Module):
-            model.fit(X, goal, epochs=args.epochs, lr=args.lr)
+            model.fit(X, goal, epochs=args.epochs, lr=args.siren_lr if name == "SIREN" else args.lr)
             torch.save(model.state_dict(), output / f"{name.lower()}_weights.pt")
         else:
             model.fit(X, goal)
         probabilities[name] = model.predict_proba(points)
         gradients[name] = (model.gradient(points) if isinstance(model, torch.nn.Module)
                            else np.array([model.gradient(q) for q in points]))
-        # Finite-difference spot check away from exact recorded coordinates.
-        q = np.array([71.3, 7.2])
-        eps = .001 if name in ("Logistic", "Kernel") else .02
-        numeric = np.array([(model.predict_proba(np.array([q + eps*a]))[0]
-                             - model.predict_proba(np.array([q - eps*a]))[0]) / (2*eps)
-                            for a in np.eye(2)])
-        analytic = model.gradient(q)
+        check = gradient_check(model)
         magnitude = np.linalg.norm(gradients[name], axis=1)
         report["models"][name] = {
             "xg_min": float(probabilities[name].min()), "xg_max": float(probabilities[name].max()),
             "median_gradient": float(np.median(magnitude)), "p95_gradient": float(np.quantile(magnitude, .95)),
-            "finite_difference_check": {"point": q.tolist(), "step_ft": eps,
-                "analytic": analytic.tolist(), "numeric": numeric.tolist(),
-                "max_absolute_error": float(np.abs(analytic - numeric).max())}}
-        print(f"Finished {name}; gradient check error {np.abs(analytic-numeric).max():.2g}", flush=True)
+            "finite_difference_check": check}
+        print(f"Finished {name}; gradient check error {check['max_absolute_error']:.2g}", flush=True)
 
     for a, b in combinations(factories, 2):
         ga, gb = gradients[a], gradients[b]
@@ -143,43 +233,7 @@ def main():
                         **{f"{k}_gradient": v for k,v in gradients.items()})
     (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
 
-    fig, axes = plt.subplots(2, 4, figsize=(16, 10))
-    fig.subplots_adjust(left=.055, right=.89, top=.83, bottom=.15, wspace=.16, hspace=.22)
-    max_p = max(p.max() for p in probabilities.values()) * 100
-    max_g = max(np.linalg.norm(g,axis=1).max() for g in gradients.values()) * 100
-    labels = {"Kernel": "Kernel", "Logistic": "Logistic",
-              "MLP": "MLP", "SIREN": "SIREN"}
-    for column, name in enumerate(labels):
-        for row, values in enumerate([probabilities[name]*100, np.linalg.norm(gradients[name],axis=1)*100]):
-            surface = np.full(len(grid), np.nan)
-            surface[keep] = values
-            im = axes[row,column].imshow(surface.reshape(xx.shape), origin="lower",
-                extent=(23.75,101.25,-41.25,41.25), interpolation="nearest", cmap="Blues" if row==0 else "Purples",
-                norm=plt.Normalize(0,max_p) if row==0 else PowerNorm(.5,vmin=0,vmax=max_g))
-            rink(axes[row,column])
-            if row == 0:
-                axes[row,column].set_title(labels[name], fontsize=13, pad=12)
-                probability_image = im
-            else:
-                gradient_image = im
-                axes[row,column].set_xlabel("Distance from center ice (ft)", fontsize=9)
-            if column == 0:
-                axes[row,column].set_ylabel("Across the rink (ft)", fontsize=9)
-        # Unit-length arrows display direction only; bottom row supplies magnitudes.
-        arrow = (np.isclose(points[:,0] % 10,0) & np.isclose(points[:,1] % 10,0))
-        g = gradients[name];length=np.linalg.norm(g,axis=1);arrow &= length>1e-5
-        axes[0,column].quiver(points[arrow,0],points[arrow,1],g[arrow,0]/length[arrow],g[arrow,1]/length[arrow],
-            angles="xy",scale_units="xy",scale=.22,width=.006,color="#38434a",alpha=.8)
-    fig.colorbar(probability_image,cax=fig.add_axes([.915,.525,.012,.28]),label="Chance of scoring (%)")
-    fig.colorbar(gradient_image,cax=fig.add_axes([.915,.165,.012,.28]),label="How quickly the chance changes\nPercentage points per foot · square-root colors")
-    fig.text(.055,.955,"Where each model sees a scoring chance",fontsize=23,weight="bold")
-    fig.text(.055,.915,f"{len(X):,} shots and attempts · 5-on-5, regular season, no overtime · 2009–10 to 2023–24",fontsize=12)
-    fig.text(.055,.875,"Top: scoring chance, with arrows toward higher chances. Bottom: how much a small move changes the prediction.",fontsize=11)
-    fig.text(.055,.096,"All teams shoot right. Colors use the same scale; arrows show direction only. Gray areas have too few shots or are outside the rink.",fontsize=9)
-    fig.text(.055,.067,f"Both networks: two hidden layers of 128 neurons. Trained for {args.epochs} passes. Kernel: {args.radius:g}-ft radius.",fontsize=9)
-    fig.text(.055,.038,"Source: NHL play-by-play. Final test seasons are held back. The kernel can jump when a shot enters or leaves its neighborhood.",fontsize=9)
-    fig.savefig(output / "scoring_geometry.png", dpi=170, facecolor="white")
-    fig.savefig(output / "scoring_geometry.pdf", facecolor="white")
+    render(output)
     print(json.dumps(report, indent=2), flush=True)
 
 

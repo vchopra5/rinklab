@@ -4,7 +4,7 @@ from normalize_data import LoadHockeyShots
 from season_cv import SeasonCV
 
 class KernelRegression2D:
-    def __init__(self, bandwidth=4, radius=1.0):
+    def __init__(self, bandwidth=2, radius=3.0):
         self.h = bandwidth
         self.radius = radius
     
