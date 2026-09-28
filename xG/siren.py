@@ -19,11 +19,11 @@ class SIREN2D(nn.Module):
         super().__init__()
 
         self.layers = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(2, 128),
             Sine(omega),
-            nn.Linear(32, 32),
+            nn.Linear(128, 128),
             Sine(omega),
-            nn.Linear(32, 1),
+            nn.Linear(128, 1),
         )
 
         # First-layer and hidden/output-layer SIREN weight initialization.

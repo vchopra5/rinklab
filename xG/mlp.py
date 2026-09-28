@@ -10,11 +10,11 @@ class MLP2D(nn.Module):
         super().__init__()
 
         self.layers = nn.Sequential(
-            nn.Linear(2, 32),
+            nn.Linear(2, 128),
             nn.Tanh(),
-            nn.Linear(32, 32),
+            nn.Linear(128, 128),
             nn.Tanh(),
-            nn.Linear(32, 1),
+            nn.Linear(128, 1),
         )
     
     def forward(self, X):

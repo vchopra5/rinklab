@@ -47,7 +47,13 @@ def main():
     parser.add_argument("--radius", type=float, default=1.0)
     parser.add_argument("--omega", type=float, default=30)
     parser.add_argument("--seed", type=int, default=42)
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--siren-only", action="store_true",
+                        help="Retrain SIREN and reuse the other saved model surfaces.")
+    selection.add_argument("--mlp-only", action="store_true",
+                           help="Retrain MLP and reuse the other saved model surfaces.")
     args = parser.parse_args()
+    only = "SIREN" if args.siren_only else "MLP" if args.mlp_only else None
     torch.set_num_threads(2)
     root = Path(__file__).resolve().parent
     output = root / "analysis" / "geometry"
@@ -78,13 +84,23 @@ def main():
     report = {"training_end_season": "2023–24", "n_train": len(X),
               "n_games": int(data.game_id.nunique()), "settings": vars(args),
               "grid_step_ft": 2.5, "support": "At least 100 attempts within 5 ft and 20 within the kernel radius; inside rink",
-              "neural_hidden_layers": 2, "neural_width": 32,
+              "neural_hidden_layers": 2, "neural_width": {"MLP": 128, "SIREN": 128},
               "supported_grid_points": len(points), "gradient_units": "probability per foot",
               "caveats": ["Single seed, fixed training schedule; no claim of tuned predictive superiority.",
                           "Kernel gradient holds its radius-based neighbor set fixed; cutoff boundaries can jump.",
                           "Logistic uses (x, y squared); the other models use (x, y)."],
               "models": {}, "pairwise": []}
+    if only:
+        previous = json.loads((output / "comparison.json").read_text())
+        with np.load(output / "surfaces.npz") as saved:
+            for name in factories:
+                if name != only:
+                    probabilities[name] = saved[f"{name}_probability"]
+                    gradients[name] = saved[f"{name}_gradient"]
+                    report["models"][name] = previous["models"][name]
     for name, factory in factories.items():
+        if only and name != only:
+            continue
         print(f"Fitting {name}", flush=True)
         torch.manual_seed(args.seed)
         model = factory()
@@ -131,9 +147,9 @@ def main():
     fig.subplots_adjust(left=.055, right=.89, top=.83, bottom=.15, wspace=.16, hspace=.22)
     max_p = max(p.max() for p in probabilities.values()) * 100
     max_g = max(np.linalg.norm(g,axis=1).max() for g in gradients.values()) * 100
-    labels = {"Logistic": "Logistic regression", "Kernel": f"Kernel · {args.radius:g}-ft neighborhood",
-              "MLP": "Neural network", "SIREN": "SIREN"}
-    for column, name in enumerate(factories):
+    labels = {"Kernel": "Kernel", "Logistic": "Logistic",
+              "MLP": "MLP", "SIREN": "SIREN"}
+    for column, name in enumerate(labels):
         for row, values in enumerate([probabilities[name]*100, np.linalg.norm(gradients[name],axis=1)*100]):
             surface = np.full(len(grid), np.nan)
             surface[keep] = values
@@ -160,7 +176,7 @@ def main():
     fig.text(.055,.915,f"{len(X):,} shots and attempts · 5-on-5, regular season, no overtime · 2009–10 to 2023–24",fontsize=12)
     fig.text(.055,.875,"Top: scoring chance, with arrows toward higher chances. Bottom: how much a small move changes the prediction.",fontsize=11)
     fig.text(.055,.096,"All teams shoot right. Colors use the same scale; arrows show direction only. Gray areas have too few shots or are outside the rink.",fontsize=9)
-    fig.text(.055,.067,f"Both networks: two layers of 32 neurons, {args.epochs} training passes. Kernel: {args.radius:g}-ft radius. These maps do not tell us which model is better.",fontsize=9)
+    fig.text(.055,.067,f"Both networks: two hidden layers of 128 neurons. Trained for {args.epochs} passes. Kernel: {args.radius:g}-ft radius.",fontsize=9)
     fig.text(.055,.038,"Source: NHL play-by-play. Final test seasons are held back. The kernel can jump when a shot enters or leaves its neighborhood.",fontsize=9)
     fig.savefig(output / "scoring_geometry.png", dpi=170, facecolor="white")
     fig.savefig(output / "scoring_geometry.pdf", facecolor="white")
