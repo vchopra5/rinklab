@@ -10,7 +10,7 @@ Code: [xG/](xG/)
 
 I was really curious about scoring "geometry": how does the probability of scoring in the NHL vary with shot location?
 
-I started with kernel regression and got a pretty uneven picture. At some points, the gradients point away from the net. I'd expected moving closer to help, at least in front of the goal line. Increasing the neighborhood radius to 3 feet made the picture smoother, though some of those surprising directions remain.
+I started with kernel regression and got a pretty uneven picture. At some points, the gradients point away from the net. I'd expected moving closer to help, at least in front of the goal line. Increasing the neighborhood radius helped, but its hard cutoff could introduce jumps. I switched to a smooth Gaussian kernel with a 2-foot bandwidth, so nearby attempts fade in influence rather than abruptly entering or leaving the neighborhood.
 
 Other models had smoother gradients. Logistic regression gives a simpler picture where moving closer to the net improves the predicted probability of scoring. The MLP (2 hidden layers, 128 neurons per layer) picks up more detail, but still smooths over a lot of the little changes you see with the kernel.
 

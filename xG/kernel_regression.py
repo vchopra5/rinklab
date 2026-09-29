@@ -4,60 +4,57 @@ from normalize_data import LoadHockeyShots
 from season_cv import SeasonCV
 
 class KernelRegression2D:
-    def __init__(self, bandwidth=2, radius=3.0):
+    def __init__(self, bandwidth=2, radius=None):
+        if not np.isfinite(bandwidth) or bandwidth <= 0:
+            raise ValueError("bandwidth must be positive and finite")
+        if radius is not None and (not np.isfinite(radius) or radius <= 0):
+            raise ValueError("radius must be positive and finite, or None")
         self.h = bandwidth
+        # None uses the full Gaussian. A radius retains the legacy hard cutoff.
         self.radius = radius
-    
+
     def fit(self, X, y):
-        # X shape: (n_samples, 2)
-        self.X = np.asarray(X)
-        self.y = np.asarray(y)
-
-        self.tree = cKDTree(self.X)
+        X, y = np.asarray(X, dtype=float), np.asarray(y, dtype=float)
+        if X.ndim != 2 or X.shape[1] != 2 or len(X) == 0 or y.shape != (len(X),):
+            raise ValueError("Expected nonempty coordinates (n, 2) and outcomes (n,)")
+        if not np.isfinite(X).all() or not np.isfinite(y).all() or not np.isin(y, [0, 1]).all():
+            raise ValueError("Coordinates must be finite and outcomes binary")
+        # Exact compression of repeated locations, not spatial binning.
+        self.locations, inverse, self.counts = np.unique(X, axis=0, return_inverse=True, return_counts=True)
+        self.goals = np.bincount(inverse, weights=y, minlength=len(self.locations))
+        self.tree = cKDTree(self.locations)
         return self
-    
+
+    def _evaluate(self, X, derivatives=False):
+        X = np.asarray(X, dtype=float).reshape(-1, 2)
+        result = []
+        for q in X:
+            idx = (slice(None) if self.radius is None
+                   else self.tree.query_ball_point(q, r=self.radius))
+            diff = self.locations[idx] - q
+            if len(diff) == 0:
+                raise ValueError("No attempts inside the requested hard radius")
+            distance2 = np.sum(diff**2, axis=1)
+            # Common rescaling cancels in the probability and gradient ratios.
+            w = np.exp(-(distance2 - distance2.min()) / (2 * self.h**2))
+            counts, goals = self.counts[idx], self.goals[idx]
+            denominator = np.sum(w * counts)
+            probability = np.sum(w * goals) / denominator
+            if derivatives:
+                residual = w * (goals - probability * counts)
+                result.append(np.sum(residual[:, None] * diff, axis=0) / (self.h**2 * denominator))
+            else:
+                result.append(probability)
+        return np.asarray(result).reshape((-1, 2) if derivatives else (-1,))
+
     def predict_proba(self, X):
-        X = np.asarray(X)
-
-        locations, inverse = np.unique(
-            X, axis=0, return_inverse=True
-        )
-
-        probabilities = np.empty(len(locations))
-
-        for i, x in enumerate(locations):
-            idx = self.tree.query_ball_point(x, r=self.radius)
-
-            Xn = self.X[idx]
-            yn = self.y[idx]
-
-            diff = Xn - x
-            dist2 = np.sum(diff**2, axis=1)
-
-            w = np.exp(-dist2 / (2 * self.h**2))
-
-            probabilities[i] = np.sum(w * yn) / np.sum(w)
-
-        return probabilities[inverse]
-
+        locations, inverse = np.unique(np.asarray(X, dtype=float).reshape(-1, 2), axis=0, return_inverse=True)
+        return self._evaluate(locations)[inverse]
 
     def gradient(self, coord):
-        idx = self.tree.query_ball_point(coord, r=self.radius)
-        Xn = self.X[idx]
-        yn = self.y[idx]
-        diff = Xn - coord
-        dist2 = np.sum(diff**2, axis=1)
-
-        w = np.exp(-dist2 / (2 * self.h**2))
-        p_hat = np.sum(w * yn) / np.sum(w)
-
-        weighted_residual = w * (yn - p_hat)
-        denominator = self.h**2 * np.sum(w)
-
-        grad_x = np.sum(weighted_residual * diff[:, 0]) / denominator
-        grad_y = np.sum(weighted_residual * diff[:, 1]) / denominator
-
-        return np.array([grad_x, grad_y])
+        coord = np.asarray(coord, dtype=float)
+        gradient = self._evaluate(coord, derivatives=True)
+        return gradient[0] if coord.ndim == 1 else gradient
 
 if __name__ == '__main__':
     data = LoadHockeyShots().load_data()

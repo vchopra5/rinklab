@@ -77,7 +77,8 @@ def render(folder, destination=None):
     pmax = max(p.max() for p in probabilities.values())
     gmax = max(np.linalg.norm(g,axis=1).max() for g in gradients.values())
     widths = settings.get('siren_hidden_sizes',[32,32,32])
-    subtitles = [f"radius {settings['radius']:g} ft · bandwidth {settings['bandwidth']:g} ft",
+    kernel_label = ("Gaussian · no cutoff" if settings.get("radius") is None else f"radius {settings['radius']:g} ft")
+    subtitles = [f"{kernel_label} · h {settings['bandwidth']:g} ft",
                  'features: x and y²', '128 → 128 · tanh',
                  ' → '.join(map(str,widths)) + f" · lr {settings.get('siren_lr',1e-4):g}"]
     fig, axes = plt.subplots(2,4,figsize=(14,9))
@@ -114,7 +115,8 @@ def render(folder, destination=None):
     fig.text(.055,.125,'Shared scales within each row; gradient colors use a square-root scale. Gray = outside rink or insufficient data.',fontsize=9)
     fig.text(.055,.096,'Arrows show direction only and appear at magnitudes ≥ 0.1 percentage points/ft. All teams shoot right.',fontsize=9)
     fig.text(.055,.067,f"Neural models: {settings['epochs']} epochs, seed {settings['seed']}. SIREN: raw x, y, omega {settings['omega']:g}. Held-out seasons not evaluated.",fontsize=9)
-    fig.text(.055,.038,'Kernel gradients hold neighbors fixed; radius boundaries can jump. These are associations among recorded attempts.',fontsize=9)
+    kernel_note = ('Gaussian kernel includes all recorded locations; no hard neighborhood cutoff.' if settings.get('radius') is None else 'Kernel gradients hold neighbors fixed; radius boundaries can jump.')
+    fig.text(.055,.038,kernel_note + ' Associations among recorded attempts.',fontsize=9)
     fig.savefig(destination/'scoring_geometry.png',dpi=180,facecolor='white')
     fig.savefig(destination/'scoring_geometry.pdf',facecolor='white')
     plt.close(fig)
@@ -127,9 +129,7 @@ def main():
     parser.add_argument("--siren-lr", type=float, default=.0001)
     parser.add_argument("--siren-hidden-sizes", type=int, nargs="+", default=[32, 32, 32])
     parser.add_argument("--bandwidth", type=float, default=2)
-    parser.add_argument("--radius", type=float, default=3.0)
-    parser.add_argument("--support-radius", type=float, default=1.0,
-                        help="Fixed data-support radius for comparable plotted locations")
+    parser.add_argument("--radius", type=float, default=None, help="Optional legacy hard cutoff; default is full Gaussian")
     parser.add_argument("--omega", type=float, default=30)
     parser.add_argument("--seed", type=int, default=42)
     selection = parser.add_mutually_exclusive_group()
@@ -137,9 +137,11 @@ def main():
                         help="Retrain SIREN and reuse the other saved model surfaces.")
     selection.add_argument("--mlp-only", action="store_true",
                            help="Retrain MLP and reuse the other saved model surfaces.")
+    selection.add_argument("--kernel-only", action="store_true", help="Refit kernel and reuse saved neural surfaces")
+    selection.add_argument("--reuse-neural", action="store_true", help="Re-evaluate saved neural weights on the current grid")
     parser.add_argument("--plot-only", action="store_true", help="Redraw saved results without fitting")
     args = parser.parse_args()
-    only = "SIREN" if args.siren_only else "MLP" if args.mlp_only else None
+    only = "SIREN" if args.siren_only else "MLP" if args.mlp_only else "Kernel" if args.kernel_only else None
     torch.set_num_threads(2)
     root = Path(__file__).resolve().parent
     output = root / "analysis" / "geometry"
@@ -164,28 +166,34 @@ def main():
     grid = np.column_stack([xx.ravel(), yy.ravel()])
     tree = cKDTree(X)
     support = tree.query_ball_point(grid, r=5, return_length=True)
-    local_support = tree.query_ball_point(grid, r=args.support_radius, return_length=True)
     in_rink = ((grid[:, 0] <= 72) | (np.abs(grid[:, 1]) <= 14.5)
                | ((grid[:, 0] - 72)**2 + (np.abs(grid[:, 1]) - 14.5)**2 <= 28**2))
-    keep = (support >= 100) & (local_support >= 20) & in_rink
+    keep = (support >= 100) & in_rink
     points = grid[keep]
     probabilities, gradients = {}, {}
     report = {"training_end_season": "2023–24", "n_train": len(X),
               "n_games": int(data.game_id.nunique()), "settings": vars(args),
-              "grid_step_ft": 2.5, "support": f"At least 100 attempts within 5 ft and 20 within {args.support_radius:g} ft; inside rink",
+              "grid_step_ft": 2.5, "support": "At least 100 attempts within 5 ft; inside rink. No kernel-neighborhood restriction.",
               "neural_hidden_layers": {"MLP": 2, "SIREN": len(args.siren_hidden_sizes)},
               "neural_width": {"MLP": 128, "SIREN": args.siren_hidden_sizes},
               "supported_grid_points": len(points), "gradient_units": "probability per foot",
               "caveats": ["Single seed, fixed training schedule; no claim of tuned predictive superiority.",
-                          "Kernel gradient holds its radius-based neighbor set fixed; cutoff boundaries can jump.",
+                          ("Kernel uses a full Gaussian without a hard cutoff." if args.radius is None else "Kernel gradient holds its neighbor set fixed; cutoff boundaries can jump."),
                           "Logistic uses (x, y squared); the other models use (x, y)."],
               "models": {}, "pairwise": []}
+    if args.reuse_neural:
+        previous = json.loads((output / "comparison.json").read_text())
+        for setting in ("epochs", "lr", "siren_lr", "siren_hidden_sizes", "omega", "seed"):
+            if previous["settings"].get(setting) != getattr(args, setting):
+                raise ValueError(f"Saved neural {setting} differs; rerun training.")
     if only:
         previous = json.loads((output / "comparison.json").read_text())
         for setting in ("radius", "bandwidth", "epochs", "lr", "seed", "omega"):
+            if only == "Kernel" and setting in ("radius", "bandwidth"):
+                continue
             if previous["settings"][setting] != getattr(args, setting):
                 raise ValueError(f"Saved {setting} differs; rerun all models to keep the comparison consistent.")
-        if only == "MLP" and (previous["settings"].get("siren_hidden_sizes") != args.siren_hidden_sizes
+        if only in ("MLP", "Kernel") and (previous["settings"].get("siren_hidden_sizes") != args.siren_hidden_sizes
                                or previous["settings"].get("siren_lr") != args.siren_lr):
             raise ValueError("Saved SIREN settings differ; rerun all models.")
         with np.load(output / "surfaces.npz") as saved:
@@ -203,8 +211,11 @@ def main():
         torch.manual_seed(args.seed)
         model = factory()
         if isinstance(model, torch.nn.Module):
-            model.fit(X, goal, epochs=args.epochs, lr=args.siren_lr if name == "SIREN" else args.lr)
-            torch.save(model.state_dict(), output / f"{name.lower()}_weights.pt")
+            if args.reuse_neural:
+                model.load_state_dict(torch.load(output / f"{name.lower()}_weights.pt", weights_only=True))
+            else:
+                model.fit(X, goal, epochs=args.epochs, lr=args.siren_lr if name == "SIREN" else args.lr)
+                torch.save(model.state_dict(), output / f"{name.lower()}_weights.pt")
         else:
             model.fit(X, goal)
         probabilities[name] = model.predict_proba(points)
@@ -224,11 +235,12 @@ def main():
         nonflat = (na > 1e-5) & (nb > 1e-5)
         cosine = np.sum(ga[nonflat] * gb[nonflat], axis=1) / (na[nonflat] * nb[nonflat])
         report["pairwise"].append({"models": [a, b],
+            "gradient_vector_rmse_percentage_points_per_ft": float(100*np.sqrt(np.mean(np.sum((ga-gb)**2,axis=1)))),
             "probability_rmse_percentage_points": float(100*np.sqrt(np.mean((probabilities[a]-probabilities[b])**2))),
             "median_gradient_angle_degrees": float(np.median(np.degrees(np.arccos(np.clip(cosine,-1,1))))),
             "direction_comparison_points": int(nonflat.sum())})
 
-    np.savez_compressed(output / "surfaces.npz", locations=points, support=support[keep], local_support=local_support[keep],
+    np.savez_compressed(output / "surfaces.npz", locations=points, support=support[keep],
                         **{f"{k}_probability": v for k,v in probabilities.items()},
                         **{f"{k}_gradient": v for k,v in gradients.items()})
     (output / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
